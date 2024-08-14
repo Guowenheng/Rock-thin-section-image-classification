@@ -1,0 +1,398 @@
+# coding=utf-8
+from prototypical_batch_sampler import PrototypicalBatchSampler
+from prototypical_loss_attention  import prototypical_loss as loss_fn
+from omniglot_dataset import OmniglotDataset
+from CAFF import CAFF
+from feature_select import Chanal
+from protonet import ProtoNet
+import torch.nn as nn
+from parser_util import get_parser
+from resnet import resnet34,resnet50
+# from pytorch_pretrained_vit.vit_model import vit_base_patch16_224_in21k as create_model
+from swin_transformer.model_ssf import swin_tiny_patch4_window7_224 as create_model_swim
+from tqdm import tqdm
+import numpy as np
+import torch
+import os
+from torchvision import transforms
+data_transform = {
+        "train": transforms.Compose([transforms.RandomResizedCrop(224),
+                                     transforms.RandomHorizontalFlip(),
+                                     transforms.ToTensor(),
+                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+        "val": transforms.Compose([transforms.Resize(256),
+                                   transforms.CenterCrop(224),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
+        "test": transforms.Compose([transforms.Resize(256),
+                                   transforms.CenterCrop(224),
+                                   transforms.ToTensor(),
+                                   transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])}
+def init_seed(opt):
+    '''
+    Disable cudnn to maximize reproducibility
+    '''
+    torch.cuda.cudnn_enabled = False
+    np.random.seed(opt.manual_seed)
+    torch.manual_seed(opt.manual_seed)
+    torch.cuda.manual_seed(opt.manual_seed)
+
+
+def init_dataset(opt, mode,transform):
+    dataset = OmniglotDataset(mode=mode, root=opt.dataset_root,transform=transform[mode])
+    n_classes = len(np.unique(dataset.y))
+    print("asd"+str(n_classes))
+    if (mode=='train' and n_classes < opt.classes_per_it_tr) or (mode=='val' and n_classes < opt.classes_per_it_val):
+        raise(Exception('There are not enough classes in the dataset in order ' +
+                        'to satisfy the chosen classes_per_it. Decrease the ' +
+                        'classes_per_it_{tr/val} option and try again.'))
+    return dataset
+
+
+def init_sampler(opt, labels, mode):
+    if 'train' in mode:
+        classes_per_it = opt.classes_per_it_tr
+        num_samples = opt.num_support_tr + opt.num_query_tr
+    else:
+        classes_per_it = opt.classes_per_it_val
+        num_samples = opt.num_support_val + opt.num_query_val
+
+    return PrototypicalBatchSampler(labels=labels,
+                                    classes_per_it=classes_per_it,
+                                    num_samples=num_samples,
+                                    iterations=opt.iterations)
+
+
+def init_dataloader(opt, mode,transform):
+    dataset = init_dataset(opt, mode,transform)
+    sampler = init_sampler(opt, dataset.y, mode)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler)
+    return dataloader
+
+def init_CAFF(opt):
+    device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
+    model = CAFF(in_channels=49)
+    model.to(device)
+    return model
+
+def init_FA(opt):
+    device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
+    model = Chanal(shots=5)
+    model.to(device)
+    return model
+
+def init_protonet(opt):
+    '''
+    Initialize the ProtoNet
+    '''
+    device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
+    # model = ProtoNet().to(device)
+    # model=resnet50(include_top=False)
+    # model_weight_path ="../src/resnet50-pre.pth"
+    # weights_dict=torch.load(model_weight_path, map_location='cpu')
+    # del_keys = ['fc.weight', 'fc.bias']
+    # for k in del_keys:
+    #     del weights_dict[k]
+    # missing_keys, unexpected_keys = model.load_state_dict(weights_dict)
+    # for name, para in model.named_parameters():
+    #     para.requires_grad = False
+    # in_channel = model.fc.in_features  # 输入特征矩阵的深度
+    # model.fc = nn.Linear(in_channel, 256)
+
+    # model=create_model_swim(num_classes=256)
+    model = create_model_swim(num_classes=128,tuning_mode='None')
+    # weights_path='../dataset/vit_base_patch16_224.pth'
+    weights_path = '../dataset_ex/swin_tiny_patch4_window7_224.pth'
+    freeze_layers=True
+    # assert os.path.exists(weights_path), "weights file: '{}' not exist.".format(weights_path)
+    weights_dict = torch.load(weights_path, map_location=device)
+    weights_dict=weights_dict['model']
+    # 删除不需要的权重
+    # del_keys = ['head.weight', 'head.bias'] if model.has_logits \
+    #     else ['pre_logits.fc.weight', 'pre_logits.fc.bias', 'head.weight', 'head.bias']
+    del_keys=['head.weight', 'head.bias']
+    for k in del_keys:
+        del weights_dict[k]
+    print(model.load_state_dict(weights_dict, strict=False))
+
+    if freeze_layers:
+        for name, para in model.named_parameters():
+            #除head, pre_logits外，其他权重全部冻结
+            if "head" not in name and "pre_logits" not in name:
+                para.requires_grad_(False)
+#             # if "head." not in name and "ssf_scale" not in name and "ssf_shift_" not in name:
+#             #     para.requires_grad = False
+            else:
+                print("training {}".format(name))
+
+    model.to(device)
+    return model
+
+
+def init_optim(opt, model):
+    '''
+    Initialize optimizer
+    '''
+    return torch.optim.Adam(params=model.parameters(),
+                            lr=opt.learning_rate)
+
+
+def init_lr_scheduler(opt, optim):
+    '''
+    Initialize the learning rate scheduler
+    '''
+    return torch.optim.lr_scheduler.StepLR(optimizer=optim,
+                                           gamma=opt.lr_scheduler_gamma,
+                                           step_size=opt.lr_scheduler_step)
+    # return torch.optim.lr_scheduler.OneCycleLR(optim,max_lr=0.00005,total_steps=100)
+
+
+
+def save_list_to_file(path, thelist):
+    with open(path, 'w') as f:
+        for item in thelist:
+            f.write("%s\n" % item)
+
+
+def train(opt, tr_dataloader, model, optim, lr_scheduler,ATT,FA,optim_att,att_scheduler, val_dataloader=None):
+    '''
+    Train the model with the prototypical learning algorithm
+    '''
+
+    device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
+
+    if val_dataloader is None:
+        best_state = None
+    train_loss = []
+    train_acc = []
+    val_loss = []
+    val_acc = []
+    best_acc = 0
+
+    best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
+    last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
+
+    for epoch in range(opt.epochs):
+        print('=== Epoch: {} ==='.format(epoch))
+        tr_iter = iter(tr_dataloader)
+        model.train()
+        ATT.train()
+        FA.train()
+        for batch in tqdm(tr_iter):
+            optim.zero_grad()
+            optim_att.zero_grad()
+            x, y = batch  # (200,6,224,224)
+            x, y = x.to(device), y.to(device)
+            PPL_x = x[:, 3:6, :, :]
+            XPL_x = x[:, 0:3, :, :]
+
+            model_output1 = model(PPL_x)
+            model_output2 = model(XPL_x)#(200,49,768)
+            del PPL_x, XPL_x,x
+            model_output = ATT(model_output1, model_output2)
+            del model_output1,model_output2
+            loss, acc = loss_fn(model_output, target=y,
+                                n_support=opt.num_support_val,FA=FA)
+            del model_output,y
+            loss.backward()
+            optim.step()
+            optim_att.step()
+            train_loss.append(loss.item())
+            train_acc.append(acc.item())
+        avg_loss = np.mean(train_loss[-opt.iterations:])
+        avg_acc = np.mean(train_acc[-opt.iterations:])
+        print('Avg Train Loss: {}, Avg Train Acc: {}'.format(avg_loss, avg_acc))
+        lr_scheduler.step()
+        att_scheduler.step()
+        if val_dataloader is None:
+            continue
+        val_iter = iter(val_dataloader)
+        model.eval()
+        ATT.eval()
+        FA.eval()
+        for batch in val_iter:
+            with torch.no_grad():
+                x, y = batch  # (200,6,224,224)
+                x, y = x.to(device), y.to(device)
+                PPL_x = x[:, 3:6, :, :]
+                XPL_x = x[:, 0:3, :, :]
+
+                model_output1 = model(PPL_x)
+                model_output2 = model(XPL_x)  # (200,49,768)
+                del PPL_x, XPL_x, x
+                model_output = ATT(model_output1, model_output2)
+                del model_output1, model_output2
+                loss, acc = loss_fn(model_output, target=y,
+                                    n_support=opt.num_support_val,FA=FA)
+                del model_output, y
+
+            val_loss.append(loss.item())
+            val_acc.append(acc.item())
+        avg_loss = np.mean(val_loss[-opt.iterations:])
+        avg_acc = np.mean(val_acc[-opt.iterations:])
+        postfix = ' (Best)' if avg_acc >= best_acc else ' (Best: {})'.format(
+            best_acc)
+        print('Avg Val Loss: {}, Avg Val Acc: {}{}'.format(
+            avg_loss, avg_acc, postfix))
+        if avg_acc >= best_acc:
+            torch.save({'baseline':model.state_dict(),'att':ATT.state_dict(),'FA':FA.state_dict()}, best_model_path)
+
+            best_acc = avg_acc
+            best_state = {'baseline':model.state_dict(),'att':ATT.state_dict(),'FA':FA.state_dict()}
+        torch.cuda.empty_cache()
+
+    torch.save({'baseline':model.state_dict(),'att':ATT.state_dict(),'FA':FA.state_dict()}, last_model_path)
+
+    for name in ['train_loss', 'train_acc', 'val_loss', 'val_acc']:
+        save_list_to_file(os.path.join(opt.experiment_root,
+                                       name + '.txt'), locals()[name])
+
+    return best_state, best_acc, train_loss, train_acc, val_loss, val_acc
+
+
+def test(opt, test_dataloader, model,ATT,FA):
+    '''
+    Test the model trained with the prototypical learning algorithm
+    '''
+    device = 'cuda:0' if torch.cuda.is_available() and opt.cuda else 'cpu'
+    avg_acc = list()
+    for epoch in range(3):
+        print('=== Test Epoch: {} ==='.format(epoch))
+        test_iter = iter(test_dataloader)
+        for batch in tqdm(test_iter):
+            x, y = batch
+            x, y = x.to(device), y.to(device)
+            PPL_x = x[:, 3:6, :, :]
+            XPL_x = x[:, 0:3, :, :]
+            model.eval()
+            ATT.eval()
+            FA.eval()
+            model_output1 = model(PPL_x)
+            model_output2 = model(XPL_x)  # (200,49,768)
+            model_output = ATT(model_output1, model_output2)
+            loss, acc = loss_fn(model_output, target=y,
+                                n_support=opt.num_support_val,FA=FA)
+            avg_acc.append(acc.item())
+    test_num = len(avg_acc)
+    avg_std = np.std(avg_acc)
+    avg_acc = np.mean(avg_acc)
+
+    print('Test Acc: {}'.format(avg_acc))
+    print('test std:{}'.format(avg_std))
+    print('test length:{}'.format(test_num))
+    return avg_acc
+
+
+def eval():
+    '''
+    Initialize everything and train
+    '''
+    options = get_parser().parse_args()
+
+    if torch.cuda.is_available() and not options.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+
+    init_seed(options)
+    test_dataloader = init_dataloader(options)
+    model = init_protonet(options)
+    ATT = init_CAFF(options)
+    model_path = os.path.join(options.experiment_root, 'best_model.pth')
+    model_stats=torch.load(model_path)
+    model.load_state_dict(model_stats['baseline'])
+    ATT.load_state_dict(model_stats['att'])
+    print('--------------------','test with best model','--------------------')
+    test(opt=options,
+         test_dataloader=test_dataloader,
+         model=model,
+         ATT=ATT,
+         FA=FA)
+    model_path = os.path.join(options.experiment_root, 'last_model.pth')
+    model_stats = torch.load(model_path)
+    model.load_state_dict(model_stats['baseline'])
+    ATT.load_state_dict(model_stats['att'])
+    print('--------------------', 'test with last model', '--------------------')
+    test(opt=options,
+         test_dataloader=test_dataloader,
+         model=model,
+         ATT=ATT,
+         FA=FA)
+
+
+def main():
+    '''
+    Initialize everything and train
+    '''
+    options = get_parser().parse_args()
+    if not os.path.exists(options.experiment_root):
+        os.makedirs(options.experiment_root)
+
+    if torch.cuda.is_available() and not options.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+
+    init_seed(options)
+
+    tr_dataloader = init_dataloader(options, 'train',data_transform)
+    val_dataloader = init_dataloader(options, 'val',data_transform)
+    # trainval_dataloader = init_dataloader(options, 'trainval')
+    test_dataloader = init_dataloader(options, 'test',data_transform)
+
+    model = init_protonet(options)
+    optim = init_optim(options, model)
+    lr_scheduler = init_lr_scheduler(options, optim)
+    FA =init_FA(options)
+    ATT = init_CAFF(options)
+    optim_att=torch.optim.Adam(params=list(ATT.parameters())+list(FA.parameters()),
+                     lr=0.01)
+    att_scheduler=torch.optim.lr_scheduler.StepLR(optimizer=optim_att,
+                                    gamma=options.lr_scheduler_gamma,
+                                    step_size=options.lr_scheduler_step)
+    # att_scheduler = torch.optim.lr_scheduler.OneCycleLR(optim_att, max_lr=0.005, total_steps=100)
+
+
+    res = train(opt=options,
+                tr_dataloader=tr_dataloader,
+                val_dataloader=val_dataloader,
+                model=model,
+                optim=optim,
+                lr_scheduler=lr_scheduler,
+                ATT=ATT,
+                FA =FA,
+                optim_att=optim_att,
+                att_scheduler=att_scheduler)
+    best_state, best_acc, train_loss, train_acc, val_loss, val_acc = res
+    print('Testing with last model..')
+    test(opt=options,
+         test_dataloader=test_dataloader,
+         model=model,
+         ATT=ATT,
+         FA =FA)
+
+    model.load_state_dict(best_state['baseline'])
+    ATT.load_state_dict(best_state['att'])
+    FA.load_state_dict(best_state['FA'])
+    print('Testing with best model..')
+    test(opt=options,
+         test_dataloader=test_dataloader,
+         model=model,
+         ATT=ATT,
+         FA =FA)
+
+    # optim = init_optim(options, model)
+    # lr_scheduler = init_lr_scheduler(options, optim)
+
+    # print('Training on train+val set..')
+    # train(opt=options,
+    #       tr_dataloader=trainval_dataloader,
+    #       val_dataloader=None,
+    #       model=model,
+    #       optim=optim,
+    #       lr_scheduler=lr_scheduler)
+
+    # print('Testing final model..')
+    # test(opt=options,
+    #      test_dataloader=test_dataloader,
+    #      model=model)
+
+
+if __name__ == '__main__':
+    main()
